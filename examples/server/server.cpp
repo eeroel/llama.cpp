@@ -1254,6 +1254,7 @@ struct server_slot {
 
     // for "predicted outputs"
     int32_t lookup_n_adaptive    = 1;
+    int32_t run_length           = 0;  // TODO do we actually need both?
     int32_t lookup_index         = 0;
 
     // n_prompt_tokens may not be equal to prompt_tokens.size(), because prompt maybe truncated
@@ -2111,9 +2112,10 @@ struct server_context {
         slot.sampled = result.tok;
 
         slot.generated_text += token_str;
-        if (slot.params.return_tokens) {
-            slot.generated_tokens.push_back(result.tok);
-        }
+
+        // TODO is this OK? We kinda need generated tokens in the lookup logic
+        // (do we really? or is the last one enough and we maintain a cache?)
+        slot.generated_tokens.push_back(result.tok);
         slot.has_next_token = true;
 
         // check if there is incomplete UTF-8 character at the end
@@ -3252,9 +3254,14 @@ struct server_context {
                 // otherwise reset to zero
                 auto draft_start_pos = 1;
                 bool found = false;
-                // first look for a match from the expected position
+
+                // first look for a match from the previous position
                 SLT_DBG(slot, "Looking up prediction tokens at index %d/%d\n", (int) slot.lookup_index, (int) slot.prediction_tokens.size());
-                if (slot.lookup_index > 0 && 
+                if (slot.generated_tokens.empty()) {
+                    continue;
+                }
+                if (slot.lookup_n_adaptive != 0 &&  // 0 signals reset
+                    slot.lookup_index > 0 && 
                     slot.lookup_index < static_cast<int32_t>(slot.prediction_tokens.size()) && 
                     slot.prediction_tokens[slot.lookup_index-1] == slot.sampled) {
                     found = true;
@@ -3262,20 +3269,53 @@ struct server_context {
                     // TODO what is a good scaling law here?
                     // going for too large windows too fast will likely fail,
                     // but also too small windows in the beginning hurt perf
-                    slot.lookup_n_adaptive = std::max(16, slot.lookup_n_adaptive*2);
+                    slot.run_length += slot.lookup_n_adaptive;
+                    slot.lookup_n_adaptive = std::max(16, slot.run_length * 2);
                 } else {
-                    // find first match in prediction_tokens
+                    // find longest subsequence match in prediction_tokens
                     slot.lookup_n_adaptive = 1; // default
-                    for (; draft_start_pos < static_cast<int32_t>(slot.prediction_tokens.size()); draft_start_pos++) {
-                        if (slot.prediction_tokens[draft_start_pos-1] == slot.sampled) {
-                            found = true;
-                            break;
+                    slot.run_length = 0;
+                    std::vector<int> candidates;
+
+                    // TODO use cache
+                    for (int i = 0; i < static_cast<int32_t>(slot.prediction_tokens.size()); i++) {
+                        if (slot.prediction_tokens[i] == slot.generated_tokens.back()) {
+                            candidates.push_back(i);
                         }
                     }
+
+                    int offset = 0;
+                    int max_length = 1;
+                    if (candidates.empty()) {
+                        draft_start_pos = 0;
+                        slot.lookup_n_adaptive = 1;
+                        break;
+                    }
+
+                    while (!candidates.empty()) {
+                        offset++;
+                        // todo remove from existing instead of creating new every iteration 
+                        std::vector<int> matches;
+                        for (int idx : candidates) {
+                            if (*(slot.generated_tokens.end() - offset - 1) == slot.prediction_tokens[idx - offset]) {
+                                matches.push_back(idx);
+                            }
+                        }
+                        if (matches.empty()) {
+                            break;
+                        }
+                        max_length = offset;
+                        candidates = matches;
+                    }
+                    found = true;
+                    bool is_unique = candidates.size() == 1;
+                    draft_start_pos = candidates.empty()? -1 : candidates[0] + 1;
+                    // set window size based on match length
+                    // for non-unique matches we use a more conservative window
+                    slot.lookup_n_adaptive = (is_unique? max_length * 2 : std::min(max_length, 8));
                 }
                 if (!found) continue;
 
-                // we erase the accepted tokens later, so we're looking for the same position next time
                 // increment by one because the next token will be generated
                 slot.lookup_index = draft_start_pos + 1;
 
@@ -3320,22 +3360,12 @@ struct server_context {
                 const auto ids = common_sampler_sample_and_accept_n(slot.smpl, ctx, draft);
 
                 const auto n_accepted = ids.size() - 1;
-                slot.n_lookup_used   += n_accepted;
+                slot.n_lookup_used   += n_accepted;  // TODO doesn't work like this if we don't erase
+                slot.lookup_index    += n_accepted; // TODO or +1?
 
-                if (n_accepted > 0) {
-                   // remove the prediction tokens that were used + the next token
-                   // (because it will be generated)
-                   slot.prediction_tokens.erase(
-                       slot.prediction_tokens.begin() + draft_start_pos,
-                       std::min(
-                           slot.prediction_tokens.end(),
-                           slot.prediction_tokens.begin() + draft_start_pos + n_accepted + 1
-                       )
-                   );
-                   if (n_accepted < draft.size()) {
-                        // reset speculation as we didn't use the full draft
-                        slot.lookup_n_adaptive = 1;
-                   }
+                if (n_accepted < draft.size()) {
+                    // reset speculation as we didn't use the full draft
+                    slot.lookup_n_adaptive = 0;
                 }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
