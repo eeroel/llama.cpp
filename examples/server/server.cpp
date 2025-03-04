@@ -3307,12 +3307,14 @@ struct server_context {
                         max_length = offset;
                         candidates = matches;
                     }
-                    found = true;
                     bool is_unique = candidates.size() == 1;
+                    found = true;
                     draft_start_pos = candidates.empty()? -1 : candidates[0] + 1;
                     // set window size based on match length
                     // for non-unique matches we use a more conservative window
-                    slot.lookup_n_adaptive = (is_unique? max_length * 2 : std::min(max_length, 8));
+                    // NOTE: one option would be to not speculate at all, this is
+                    // potentially good
+                    slot.lookup_n_adaptive = (is_unique ? max_length * 2 : 1);
                 }
                 if (!found) continue;
 
@@ -3361,7 +3363,7 @@ struct server_context {
 
                 const auto n_accepted = ids.size() - 1;
                 slot.n_lookup_used   += n_accepted;  // TODO doesn't work like this if we don't erase
-                slot.lookup_index    += n_accepted; // TODO or +1?
+                slot.lookup_index    += n_accepted + 1; // TODO why +1?
 
                 if (n_accepted < draft.size()) {
                     // reset speculation as we didn't use the full draft
