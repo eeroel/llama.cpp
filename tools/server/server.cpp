@@ -3958,18 +3958,8 @@ struct server_context {
                 if (slot.generated_tokens.empty()) {
                     continue;
                 }
-                if (slot.lookup_n_adaptive != 0 &&  // 0 signals reset
-                    slot.lookup_index > 0 && 
-                    slot.lookup_index < static_cast<int32_t>(slot.prediction_tokens.size()) && 
-                    slot.prediction_tokens[slot.lookup_index-1] == slot.sampled) {
-                    found = true;
-                    draft_start_pos = slot.lookup_index;
-                    // TODO what is a good scaling law here?
-                    // going for too large windows too fast will likely fail,
-                    // but also too small windows in the beginning hurt perf
-                    slot.run_length += slot.lookup_n_adaptive;
-                    slot.lookup_n_adaptive = std::max(16, slot.run_length * 2);
-                } else {
+
+                {
                     // find longest subsequence match in prediction_tokens
                     slot.lookup_n_adaptive = 1; // default
                     slot.run_length = 0;
@@ -4009,10 +3999,34 @@ struct server_context {
                     found = true;
                     draft_start_pos = candidates.empty()? -1 : candidates[0] + 1;
                     // set window size based on match length
+                    //
+                    // TODO choose best window size at each step
+                    // going for too large windows too fast will likely fail,
+                    // but also too small windows in the beginning hurt perf
+                    // idea: minimize expected regret
+                    // - at any time step this is the cost of rejected tokens + opportunity cost of not drafting enough
+                    // - the expected regret is the average of regrets for different window sizes, weighted by probability
+                    // of window size == position of next edit
+                    // - if "regret per token" is the same in both directions, then the expected regret
+                    // is minimized at the expected value of window size
+                    //   - on the other hand, if rejection is more costly than the missed opportunity, then the
+                    //     optimal choice of window would be smaller
+                    // - if we assume "tokens to next edit" is from a memoryless process 
+                    // then a reasonable guess for is *the amount of tokens seen so far*
+                    //
+                    // TODO: this is actually just an optimization of the lookup logic below
+                    // 
                     // for non-unique matches we use a more conservative window
                     // NOTE: one option would be to not speculate at all, this is
                     // potentially good
-                    slot.lookup_n_adaptive = (is_unique ? max_length * 2 : 1);
+                    //
+                    // Note also: if we do accept duplicates, a better heuristic would be
+                    // to prefer positions that have not been selected before. Because for an
+                    // "editing" task, we expect to see each bit only once, unless the requested
+                    // edit creates copies
+
+                    if (!is_unique) continue;
+                    slot.lookup_n_adaptive = 2 * max_length;
                 }
                 if (!found) continue;
 
