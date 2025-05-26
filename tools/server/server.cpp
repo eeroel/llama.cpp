@@ -258,7 +258,7 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     slot_params  params;
     server_tokens prompt_tokens;
-    server_tokens prediction_tokens;
+    llama_tokens prediction_tokens;
     int id_selected_slot = -1;
 
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
@@ -1452,8 +1452,7 @@ struct server_slot {
 
     // input prompt tokens
     server_tokens prompt_tokens;
-    server_tokens prompt_tokens;
-    server_tokens prediction_tokens;
+    llama_tokens prediction_tokens;
 
     size_t last_nl_pos = 0;
 
@@ -4104,9 +4103,9 @@ struct server_context {
                 }
 
                 slot.cache_tokens.push_back(id);
-                slot.cache_tokens.insert(slot.cache_tokens.end(), ids.begin(), ids.end() - 1);
+                slot.cache_tokens.insert({ids.begin(), ids.end() - 1});
 
-                llama_kv_cache_seq_rm(ctx, slot.id, slot.n_past, -1);
+                llama_kv_self_seq_rm(ctx, slot.id, slot.n_past, -1);
 
                 SLT_DBG(slot, "accepted %d/%d prediction tokens, new n_past = %d\n", (int) ids.size() - 1, (int) draft.size(), slot.n_past);
             }
@@ -4867,7 +4866,7 @@ int main(int argc, char ** argv, char ** envp) {
                 task.id    = ctx_server.queue_tasks.get_new_id();
                 task.index = i;
 
-                task.prompt_tokens    = std::move(tokenized_prompts[i]);
+                task.prompt_tokens    = std::move(inputs[i]);
 
                 if (!tokenized_prediction.empty()) {
                     task.prediction_tokens = std::vector(tokenized_prediction[0].begin(), tokenized_prediction[0].end());
