@@ -4105,7 +4105,7 @@ struct server_context {
                 slot.cache_tokens.push_back(id);
                 slot.cache_tokens.insert({ids.begin(), ids.end() - 1});
 
-                llama_kv_self_seq_rm(ctx, slot.id, slot.n_past, -1);
+                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.n_past, -1);
 
                 SLT_DBG(slot, "accepted %d/%d prediction tokens, new n_past = %d\n", (int) ids.size() - 1, (int) draft.size(), slot.n_past);
             }
@@ -4854,9 +4854,13 @@ int main(int argc, char ** argv, char ** envp) {
                 inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
             }
 
-            std::vector<llama_tokens> tokenized_prediction;
+            std::vector<server_tokens> tokenized_prediction_tmp;
             if (!prediction.empty()) {
-                tokenized_prediction = tokenize_input_prompts(ctx_server.vocab, prediction, true, true);
+                tokenized_prediction_tmp = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prediction, true, true);
+            }
+            std::vector<llama_tokens> tokenized_prediction(tokenized_prediction_tmp.size());
+            for (unsigned int i=0; i < tokenized_prediction.size(); ++i) {
+                tokenized_prediction[i] = tokenized_prediction_tmp[i].get_text_tokens();
             }
 
             tasks.reserve(inputs.size());
