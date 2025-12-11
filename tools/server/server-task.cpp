@@ -605,6 +605,7 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
         {"timings",             timings.to_json()},
+        {"prediction_tokens_accepted", n_lookup_used},
     };
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
@@ -640,7 +641,10 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
         {"usage", json {
             {"completion_tokens", n_decoded},
             {"prompt_tokens",     n_prompt_tokens},
-            {"total_tokens",      n_decoded + n_prompt_tokens}
+            {"total_tokens",      n_decoded + n_prompt_tokens},
+            {"completion_tokens_details", json {
+                {"accepted_prediction_tokens", n_lookup_used },
+            }}
         }},
         {"id", oaicompat_cmpl_id}
     };
@@ -692,7 +696,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         {"usage", json {
             {"completion_tokens", n_decoded},
             {"prompt_tokens",     n_prompt_tokens},
-            {"total_tokens",      n_decoded + n_prompt_tokens}
+            {"total_tokens",      n_decoded + n_prompt_tokens},
+            {"completion_tokens_details", json {
+                {"accepted_prediction_tokens", n_lookup_used },
+            }}
         }},
         {"id", oaicompat_cmpl_id}
     };
@@ -781,6 +788,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
                 {"completion_tokens", n_decoded},
                 {"prompt_tokens",     n_prompt_tokens},
                 {"total_tokens",      n_decoded + n_prompt_tokens},
+                {"completion_tokens_details", json {
+                    {"accepted_prediction_tokens", n_lookup_used },
+                }}
             }},
         });
     }

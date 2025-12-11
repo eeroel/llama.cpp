@@ -119,6 +119,7 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+    llama_tokens prediction_tokens;
 
     // only used by CLI, this delegates the tokenization to the server
     json                    cli_input = nullptr;
@@ -269,6 +270,8 @@ struct server_task_result_cmpl_final : server_task_result {
     int32_t n_decoded;
     int32_t n_prompt_tokens;
     int32_t n_tokens_cached;
+    int32_t n_lookup_used;
+
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;

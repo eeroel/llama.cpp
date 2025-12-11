@@ -89,10 +89,17 @@ struct server_slot {
 
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
+    int32_t n_past      = 0;
     int32_t n_keep      = 0;
     int32_t n_decoded   = 0;
+    int32_t n_lookup_used        = 0;
     int32_t n_remaining = -1;
     int32_t i_batch     = -1;
+
+    // for "predicted outputs"
+    int32_t lookup_n_adaptive    = 1;
+    int32_t run_length           = 0;  // TODO do we actually need both?
+    int32_t lookup_index         = 0;
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
@@ -1096,9 +1103,10 @@ struct server_context_impl {
         slot.sampled = result.tok;
 
         slot.generated_text += token_str;
-        if (slot.task->params.return_tokens) {
+        // TODO is this OK?
+        //if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
-        }
+        //}
         slot.has_next_token = true;
 
         // check if there is incomplete UTF-8 character at the end
@@ -1161,7 +1169,7 @@ struct server_context_impl {
         }
 
         if (slot.has_new_line) {
-            // require that each new line has a whitespace prefix (i.e. indentation) of at least slot.params.n_indent
+            // require that each new line has a whitespace prefix (i.e. indentation) of at least slot.task->params.n_indent
             if (slot.task->params.n_indent > 0) {
                 // check the current indentation
                 // TODO: improve by not doing it more than once for each new line
@@ -1366,6 +1374,7 @@ struct server_context_impl {
         res->n_decoded           = slot.n_decoded;
         res->n_prompt_tokens     = slot.task->n_tokens();
         res->n_tokens_cached     = slot.prompt.n_tokens();
+        res->n_lookup_used       = slot.n_lookup_used;
         res->has_new_line        = slot.has_new_line;
         res->stopping_word       = slot.stopping_word;
         res->stop                = slot.stop;
@@ -1856,7 +1865,137 @@ struct server_context_impl {
             // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
             //       perform the speculative drafting for all sequences at the same time in a single batch
             int n_draft_max = slot.get_n_draft_max();
-            if (n_draft_max > 0) {
+
+            // apply predicted outputs (lookup decoding)
+            int n_draft_max_predictions = 2048; // hardcoded for now as n_draft_max is set to zero if 
+
+            if (n_draft_max_predictions > 0 && slot.task->prediction_tokens.size() > 2 && !slot.generated_tokens.empty()) {
+
+                // add the sampled token to the batch
+                slot.i_batch_dft.push_back(batch.n_tokens);
+                common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
+                slot.prompt.tokens.push_back(slot.sampled);
+
+                // TODO move to function
+                // adaptive speculation window:
+                // increase window size every time all drafted tokens were accepted, 
+                // otherwise reset to zero
+                auto draft_start_pos = 1;
+
+                // first look for a match from the previous position
+                SLT_DBG(slot, "Looking up prediction tokens at index %d/%d\n", (int) slot.lookup_index, (int) slot.task->prediction_tokens.size());
+
+                // find longest subsequence match in prediction_tokens
+                slot.lookup_n_adaptive = 1; // default
+                slot.run_length = 0;
+                std::vector<int> candidates;
+
+                // TODO use cache
+                for (int i = 0; i < static_cast<int32_t>(slot.task->prediction_tokens.size()); i++) {
+                    if (slot.task->prediction_tokens[i] == slot.generated_tokens.back()) {
+                        candidates.push_back(i);
+                    }
+                }
+
+                int offset = 0;
+                int max_length = 1;
+                if (candidates.empty()) {
+                    draft_start_pos = 0;
+                    slot.lookup_n_adaptive = 1;
+                    break;
+                }
+
+                while (!candidates.empty()) {
+                    offset++;
+                    // todo remove from existing instead of creating new every iteration 
+                    std::vector<int> matches;
+                    for (int idx : candidates) {
+                        if (*(slot.generated_tokens.end() - offset - 1) == slot.task->prediction_tokens[idx - offset]) {
+                            matches.push_back(idx);
+                        }
+                    }
+                    if (matches.empty()) {
+                        break;
+                    }
+                    max_length = offset;
+                    candidates = matches;
+                }
+                bool is_unique = candidates.size() == 1;
+                draft_start_pos = candidates.empty()? -1 : candidates[0] + 1;
+                // set window size based on match length
+                //
+                // TODO choose best window size at each step
+                // going for too large windows too fast will likely fail,
+                // but also too small windows in the beginning hurt perf
+                // idea: minimize expected regret
+                // - at any time step this is the cost of rejected tokens + opportunity cost of not drafting enough
+                // - the expected regret is the average of regrets for different window sizes, weighted by probability
+                // of window size == position of next edit
+                // - if "regret per token" is the same in both directions, then the expected regret
+                // is minimized at the expected value of window size
+                //   - on the other hand, if rejection is more costly than the missed opportunity, then the
+                //     optimal choice of window would be smaller
+                // - if we assume "tokens to next edit" is from a memoryless process 
+                // then a reasonable guess for is *the amount of tokens seen so far*
+                //
+                // TODO: this is actually just an optimization of the lookup logic below
+                // 
+                // for non-unique matches we use a more conservative window
+                // NOTE: one option would be to not speculate at all, this is
+                // potentially good
+                //
+                // Note also: if we do accept duplicates, a better heuristic would be
+                // to prefer positions that have not been selected before. Because for an
+                // "editing" task, we expect to see each bit only once, unless the requested
+                // edit creates copies
+
+                if (is_unique) {
+                    slot.lookup_n_adaptive = 2 * max_length;
+
+                    // increment by one because the next token will be generated
+                    slot.lookup_index = draft_start_pos + 1;
+
+                    llama_tokens draft = std::vector(
+                        slot.task->prediction_tokens.begin() + draft_start_pos,
+                        slot.task->prediction_tokens.end()
+                    );
+
+                    // determine the max draft that fits the current slot state
+                    int _n_draft_max = slot.lookup_n_adaptive;
+                    _n_draft_max = std::min(_n_draft_max, slot.n_ctx - slot.n_past - 2);
+
+                    if (slot.n_remaining > 0) {
+                        _n_draft_max = std::min(_n_draft_max, slot.n_remaining - 1);
+                    }
+
+                    _n_draft_max = std::min(_n_draft_max, static_cast<int>(draft.size()));
+                    // NOTE: we use speculative.n_max here as the upper limit, but
+                    // in general we want to allow large drafts, as opposed to when
+                    // using a draft model. But this is linked to `slot.batch_spec`
+                    // size also.
+                    _n_draft_max = std::min(_n_draft_max, n_draft_max_predictions);
+
+                    SLT_DBG(slot, "max possible draft: %d\n", _n_draft_max);
+
+                    // keep track of total number of drafted tokens tested
+                    slot.n_draft_total += draft.size();
+
+                    draft.resize(_n_draft_max);
+
+                    // add all drafted tokens to the batch
+                    for (size_t i = 0; i < draft.size(); i++) {
+                        slot.i_batch_dft.push_back(batch.n_tokens);
+                        common_batch_add(batch, draft[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
+                        slot.prompt.tokens.push_back(draft[i]);
+                    }
+                    slot.drafted = std::move(draft);
+                } else {
+                    // fallback to normal decoding
+                    slot.i_batch = slot.i_batch_dft[0];
+                    slot.drafted.clear();
+                    slot.i_batch_dft.clear();
+                }
+            } else if (n_draft_max > 0) {
                 if (mctx) {
                     // we should never reach this, as speculative is automatically disabled if mmproj is loaded
                     GGML_ABORT("not supported by multimodal");
@@ -1873,7 +2012,7 @@ struct server_context_impl {
                 slot.i_batch_dft.push_back(batch.n_tokens);
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
                 slot.prompt.tokens.push_back(slot.sampled);
-
+ 
                 if (slot.task->params.speculative.n_min > (int) draft.size()) {
                     SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
                     // fallback to normal decoding
@@ -2552,6 +2691,8 @@ struct server_context_impl {
 
                 slot.n_decoded += 1;
 
+                const int64_t t_current = ggml_time_us();
+
                 if (slot.n_decoded == 1) {
                     slot.t_start_generation = t_current;
                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
@@ -2575,7 +2716,6 @@ struct server_context_impl {
                     send_final_response(slot);
                     metrics.on_prediction(slot);
                     slot.release();
-
                     continue;
                 }
             }
@@ -2735,11 +2875,14 @@ static std::unique_ptr<server_res_generator> handle_completions_impl(
         std::vector<server_task> tasks;
 
         const auto & prompt = data.at("prompt");
+        const auto & prediction_obj = json_value(data, "prediction", json());
+        const auto & prediction = json_value(prediction_obj, "content", std::string());
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
 
         // process prompt
         std::vector<server_tokens> inputs;
+        
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
@@ -2748,6 +2891,16 @@ static std::unique_ptr<server_res_generator> handle_completions_impl(
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
         }
+
+        std::vector<server_tokens> tokenized_prediction_tmp;
+        if (!prediction.empty()) {
+            tokenized_prediction_tmp = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prediction, true, true);
+        }
+        std::vector<llama_tokens> tokenized_prediction(tokenized_prediction_tmp.size());
+        for (unsigned int i=0; i < tokenized_prediction.size(); ++i) {
+            tokenized_prediction[i] = tokenized_prediction_tmp[i].get_text_tokens();
+        }
+
         tasks.reserve(inputs.size());
         int idx = 0;
         for (size_t i = 0; i < inputs.size(); i++) {
@@ -2757,6 +2910,10 @@ static std::unique_ptr<server_res_generator> handle_completions_impl(
             task.index = idx++;
 
             task.tokens = std::move(inputs[i]);
+            if (!tokenized_prediction.empty()) {
+                task.prediction_tokens = std::vector(tokenized_prediction[0].begin(), tokenized_prediction[0].end());
+            }
+            
             task.params = server_task::params_from_json_cmpl(
                     ctx_server.ctx,
                     ctx_server.params_base,
