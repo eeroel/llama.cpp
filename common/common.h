@@ -353,6 +353,9 @@ struct common_params_speculative_ngram_mod {
 
     int32_t n_max = 64;
     int32_t n_min = 48;
+
+    float f_max = 2.0f;
+    float f_min = 0.5f;
 };
 
 struct common_params_speculative_ngram_map {

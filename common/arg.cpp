@@ -3807,6 +3807,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_match = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-f-max"}, "FACTOR",
+        string_format("factor to increase ngram-mod draft length after all tokens are accepted (default: %.2f)",
+            (double) params.speculative.ngram_mod.f_max),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 1.0f) {
+                throw std::invalid_argument("ngram f-max must be at least 1.0");
+            }
+            params.speculative.ngram_mod.f_max = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-f-min"}, "FACTOR",
+        string_format("factor to decrease ngram-mod draft length after no tokens are accepted (default: %.2f)",
+            (double) params.speculative.ngram_mod.f_min),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("ngram f-min must be between 0.0 and 1.0 inclusive");
+            }
+            params.speculative.ngram_mod.f_min = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",

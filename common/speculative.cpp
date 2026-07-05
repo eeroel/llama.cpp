@@ -1768,6 +1768,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // length of the last drafted n-gram (number of tokens returned by draft)
         size_t n_draft_last = 0;
 
+        // adaptive maximum number of tokens to draft
+        int32_t n_draft_max = 0;
+
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
     };
@@ -1784,8 +1787,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
-        SPC_TRC("- n_match=%d, n_max=%d, n_min=%d\n",
-                this->params.n_match, this->params.n_max, this->params.n_min);
+        SPC_TRC("- n_match=%d, n_max=%d, n_min=%d, f_max=%.2f, f_min=%.2f\n",
+                this->params.n_match, this->params.n_max, this->params.n_min,
+                (double) this->params.f_max, (double) this->params.f_min);
         SPC_TRC("- mod size=%zu (%.3f MB)\n",
                 mod.size(), (float)(mod.size_bytes())/1024/1024);
 
@@ -1795,6 +1799,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         sinfos.resize(n_seq);
+        for (auto & sinfo : sinfos) {
+            sinfo.n_draft_max = this->params.n_min;
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1802,6 +1809,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        sinfo.n_draft_max = params.n_min;
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -1851,13 +1859,15 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             sinfo.i_last = cur_len - n;
         }
 
-        result.resize(n + params.n_max);
+        const int32_t n_draft_max = std::max(0, sinfo.n_draft_max);
+
+        result.resize(n + n_draft_max);
         for (size_t i = 0; i < n - 1; ++i) {
             result[i] = prompt.at(cur_len - n + 1 + i);
         }
         result[n - 1] = dparams.id_last;
 
-        for (int i = 0; i < params.n_max; ++i) {
+        for (int i = 0; i < n_draft_max; ++i) {
             const llama_token token = mod.get(result.data() + i);
             if (token == common_ngram_mod::EMPTY) {
                 if (i < params.n_min) {
@@ -1908,6 +1918,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
+            if (n_accepted == sinfo.n_draft_last) {
+                sinfo.n_draft_max = std::min(params.n_max, (int32_t) (sinfo.n_draft_max * params.f_max));
+            } else {
+                sinfo.n_draft_max = std::max(params.n_min, (int32_t)(sinfo.n_draft_max * params.f_min));
+            }
+
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
             if (f_acc < 0.25) {
                 sinfo.n_low++;
