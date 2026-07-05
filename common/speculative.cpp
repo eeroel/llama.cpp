@@ -41,6 +41,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
 };
 
+
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
     std::string result;
     for (size_t i = 0; i < devices.size(); i++) {
@@ -799,7 +800,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (dp.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1567,7 +1568,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (dp.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2221,6 +2222,139 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
     return n_max;
 }
 
+
+/* ADAPTIVE */
+class adaptive_speculative_wrapper : public common_speculative_impl {
+public:
+    std::unique_ptr<common_speculative_impl> inner;
+
+    int32_t n_min = 1;
+    int32_t n_max = 16;
+    float decay = 0.92f;
+    float n_max_factor_reject = 0.5f;
+
+    std::vector<std::vector<float>> n_accept_depth;
+    std::vector<std::vector<float>> n_attempt_depth;
+    std::vector<int32_t> n_max_adaptive;
+    std::vector<int32_t> n_draft_last;
+
+    adaptive_speculative_wrapper(std::unique_ptr<common_speculative_impl> impl,
+                                  uint32_t n_seq,
+                                  int32_t n_min_in,
+                                  int32_t n_max_in)
+        : common_speculative_impl(impl->type, n_seq)
+        , inner(std::move(impl))
+        , n_min(std::max(1, n_min_in))
+        , n_max(n_max_in)
+    {
+        n_accept_depth.assign(n_seq, std::vector<float>(n_max + 1, 0.0f));
+        n_attempt_depth.assign(n_seq, std::vector<float>(n_max + 1, 0.0f));
+        n_max_adaptive.assign(n_seq, n_min);
+        n_draft_last.assign(n_seq, 0);
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        inner->begin(seq_id, prompt);
+    }
+
+    bool process(const llama_batch & batch_in) override {
+        return inner->process(batch_in);
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+            int32_t n = n_max_adaptive[seq_id];
+            if (dp.n_max >= 0) {
+                n = std::min(n, dp.n_max);
+            }
+
+            dp.n_max = n;
+            n_draft_last[seq_id] = n;
+            SPC_INF("draft: seq %d drafting=%d n=%d\n", seq_id, (int) dp.drafting, dp.n_max);
+        }
+
+        inner->draft(dparams);
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        SPC_INF("accept: MTP adapt seq %d: accepted %d\n",
+                    seq_id, (int) n_accepted);
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq && !is_other && n_draft_last[seq_id] > 0) {
+            const int32_t n_prev = n_max_adaptive[seq_id];
+            update_stats(seq_id, n_accepted);
+
+            float score_best = 0.0f;
+            n_max_adaptive[seq_id] = estimate_n(seq_id, score_best);
+
+            SPC_INF("accept: MTP adapt seq %d: accepted %d/%d, raw n=%d score=%.3f, n=%d prev=%d\n",
+                    seq_id, (int) n_accepted, n_draft_last[seq_id],
+                    n_max_adaptive[seq_id], (double) score_best, n_max_adaptive[seq_id], n_prev);
+        }
+
+        inner->accept(seq_id, n_accepted, is_other);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        return inner->get_state(seq_id, data);
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        inner->set_state(seq_id, data);
+    }
+
+    bool need_embd() const override { return inner->need_embd(); }
+    bool need_embd_nextn() const override { return inner->need_embd_nextn(); }
+
+private:
+    void update_stats(llama_seq_id seq_id, int32_t n_accepted) {
+        const int32_t n_obs = std::min<int32_t>(n_draft_last[seq_id], n_max);
+        const int32_t n_acc = std::min<int32_t>(n_accepted, n_obs);
+
+        for (auto & v : n_accept_depth[seq_id])  v *= decay;
+        for (auto & v : n_attempt_depth[seq_id]) v *= decay;
+
+        for (int32_t i = 1; i <= n_acc; ++i) {
+            n_accept_depth[seq_id][i]  += 1.0f;
+            n_attempt_depth[seq_id][i] += 1.0f;
+        }
+        if (n_acc < n_obs) {
+            n_attempt_depth[seq_id][n_acc + 1] += 1.0f;
+        }
+    }
+
+    float estimate_score(llama_seq_id seq_id, int32_t n) const {
+        float score = 0.0f;
+        float p_prefix = 1.0f;
+        for (int32_t i = 1; i <= n; ++i) {
+            const float acc = n_accept_depth[seq_id][i];
+            const float att = n_attempt_depth[seq_id][i];
+            const float p_i = (acc + 2.0f) / (att + 3.0f);
+            p_prefix *= p_i;
+            score += p_prefix;
+        }
+        return score - n_max_factor_reject * n;
+    }
+
+    int32_t estimate_n(llama_seq_id seq_id, float & score_best) const {
+        int32_t n_best = n_min;
+        score_best = estimate_score(seq_id, n_best);
+        for (int32_t n = n_min + 1; n <= n_max; ++n) {
+            const float score = estimate_score(seq_id, n);
+            if (score > score_best) {
+                n_best = n;
+                score_best = score;
+            }
+        }
+        return n_best;
+    }
+};
+/* END ADAPTIVE */
+
+
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
@@ -2293,7 +2427,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                //impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                auto mtp_impl = std::make_unique<common_speculative_impl_draft_mtp>(params, n_seq);
+                auto adaptive = std::make_unique<adaptive_speculative_wrapper>(std::move(mtp_impl), n_seq, params.draft.n_min, params.draft.n_max);
+                impls.push_back(std::move(adaptive));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
